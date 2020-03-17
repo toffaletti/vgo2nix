@@ -63,10 +63,15 @@ func getModules() ([]*modEntry, error) {
 		return nil, err
 	}
 
+	type goModReplacement struct {
+		Version string
+	}
+
 	type goMod struct {
 		Path    string
 		Main    bool
 		Version string
+		Replace *goModReplacement
 	}
 
 	var mods []goMod
@@ -77,6 +82,10 @@ func getModules() ([]*modEntry, error) {
 			break
 		} else if err != nil {
 			return nil, err
+		}
+
+		if mod.Replace != nil {
+			mod.Version = mod.Replace.Version
 		}
 
 		if !mod.Main {
@@ -144,11 +153,11 @@ func getPackages(keepGoing bool, numJobs int, prevDeps map[string]*Package) ([]*
 			"--fetch-submodules",
 			"--url", repoRoot.Repo,
 			"--rev", entry.rev).Output()
-		fmt.Println(fmt.Sprintf("Finished fetching %s", goPackagePath))
-
 		if err != nil {
 			return nil, wrapError(err)
 		}
+		fmt.Println(fmt.Sprintf("Finished fetching %s", goPackagePath))
+
 		var resp map[string]interface{}
 		if err := json.Unmarshal(jsonOut, &resp); err != nil {
 			return nil, wrapError(err)
