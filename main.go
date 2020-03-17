@@ -3,15 +3,18 @@ package main // import "github.com/adisbladis/vgo2nix"
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"golang.org/x/tools/go/vcs"
 	"io"
 	"math"
 	"os"
 	"os/exec"
 	"regexp"
 	"sort"
+	"strings"
+
+	"golang.org/x/tools/go/vcs"
 )
 
 type Package struct {
@@ -44,6 +47,8 @@ const depNixFormat = `  {
 func getModules() ([]*modEntry, error) {
 	var entries []*modEntry
 
+	versionPart := regexp.MustCompile(`^v\d+$`)
+	versionRev := regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
 	commitShaRev := regexp.MustCompile(`^v\d+\.\d+\.\d+-(?:\d+\.)?[0-9]{14}-(.*?)$`)
 	commitRevV2 := regexp.MustCompile("^v.*-(.{12})\\+incompatible$")
 	commitRevV3 := regexp.MustCompile(`^(v\d+\.\d+\.\d+)\+incompatible$`)
@@ -72,6 +77,29 @@ func getModules() ([]*modEntry, error) {
 		Main    bool
 		Version string
 		Replace *goModReplacement
+	}
+
+	// tagForModule will check if the go.mod file is not at the top-level
+	// and form the correct tag (module-name/version)
+	tagForModule := func(mod goMod, rev string) string {
+		// fix for versions like "v2.1.1-0.20190517191504-25dcb96d9e51+incompatible"
+		// which arrives here as "25dcb96d9e51+incompatible"
+		rev = strings.TrimSuffix(rev, "+incompatible")
+		parts := strings.Split(mod.Path, "/")
+		if len(parts) > 3 {
+			lastPart := parts[len(parts)-1]
+			if versionPart.MatchString(lastPart) {
+				return rev
+			}
+			// don't match for mods like:
+			// Path: github.com/ugorji/go/codec
+			// Version: v0.0.0-20181204163529-d75b2dcb6bc8
+			if !versionRev.MatchString(rev) {
+				return rev
+			}
+			return lastPart + "/" + rev
+		}
+		return rev
 	}
 
 	var mods []goMod
@@ -106,6 +134,7 @@ func getModules() ([]*modEntry, error) {
 		} else if commitRevV3.MatchString(rev) {
 			rev = commitRevV3.FindAllStringSubmatch(rev, -1)[0][1]
 		}
+		rev = tagForModule(mod, rev)
 		fmt.Println(fmt.Sprintf("goPackagePath %s has rev %s", mod.Path, rev))
 		entries = append(entries, &modEntry{
 			importPath: mod.Path,
@@ -124,7 +153,11 @@ func getPackages(keepGoing bool, numJobs int, prevDeps map[string]*Package) ([]*
 
 	processEntry := func(entry *modEntry) (*Package, error) {
 		wrapError := func(err error) error {
-			return fmt.Errorf("Error processing import path \"%s\": %v", entry.importPath, err)
+			var exitError *exec.ExitError
+			if errors.As(err, &exitError) {
+				return fmt.Errorf("Error processing import path \"%s\": %w\nStderr:\n%s", entry.importPath, err, string(exitError.Stderr))
+			}
+			return fmt.Errorf("Error processing import path \"%s\": %w", entry.importPath, err)
 		}
 
 		repoRoot, err := vcs.RepoRootForImportPath(
@@ -133,30 +166,31 @@ func getPackages(keepGoing bool, numJobs int, prevDeps map[string]*Package) ([]*
 		if err != nil {
 			return nil, wrapError(err)
 		}
-		goPackagePath := repoRoot.Root
+		goModule := entry.importPath
 
-		if prevPkg, ok := prevDeps[goPackagePath]; ok {
+		if prevPkg, ok := prevDeps[goModule]; ok {
 			if prevPkg.Rev == entry.rev {
 				return prevPkg, nil
 			}
 		}
 
-		fmt.Println(fmt.Sprintf("Fetching %s", goPackagePath))
+		fmt.Println(fmt.Sprintf("Fetching %s@%s", goModule, entry.rev))
 		// The options for nix-prefetch-git need to match how buildGoPackage
 		// calls fetchgit:
 		// https://github.com/NixOS/nixpkgs/blob/8d8e56824de52a0c7a64d2ad2c4ed75ed85f446a/pkgs/development/go-modules/generic/default.nix#L54-L56
 		// and fetchgit's defaults:
 		// https://github.com/NixOS/nixpkgs/blob/8d8e56824de52a0c7a64d2ad2c4ed75ed85f446a/pkgs/build-support/fetchgit/default.nix#L15-L23
-		jsonOut, err := exec.Command(
+		cmd := exec.Command(
 			"nix-prefetch-git",
 			"--quiet",
 			"--fetch-submodules",
 			"--url", repoRoot.Repo,
-			"--rev", entry.rev).Output()
+			"--rev", entry.rev)
+		jsonOut, err := cmd.Output()
 		if err != nil {
-			return nil, wrapError(err)
+			return nil, wrapError(fmt.Errorf("Error executing cmd [%s]: %w", cmd.String(), err))
 		}
-		fmt.Println(fmt.Sprintf("Finished fetching %s", goPackagePath))
+		fmt.Println(fmt.Sprintf("Finished fetching %s@%s", goModule, entry.rev))
 
 		var resp map[string]interface{}
 		if err := json.Unmarshal(jsonOut, &resp); err != nil {
@@ -169,7 +203,7 @@ func getPackages(keepGoing bool, numJobs int, prevDeps map[string]*Package) ([]*
 		}
 
 		return &Package{
-			GoPackagePath: repoRoot.Root,
+			GoPackagePath: entry.importPath,
 			URL:           repoRoot.Repo,
 			Rev:           entry.rev,
 			Sha256:        sha256,
